@@ -415,6 +415,7 @@ PyObject *ECE_init(ECElement *self, PyObject *args) {
       if(long_obj != NULL) {
         if (_PyLong_Check(long_obj)) {
           setBigNum((PyLongObject *) long_obj, &obj->elemZ);
+          BN_mod(obj->elemZ, obj->elemZ, gobj->order, gobj->ctx);
         } else {
           EXIT_IF(TRUE, "expecting a number (int or long)");
         }
@@ -881,6 +882,7 @@ static PyObject *ECE_pow(PyObject *o1, PyObject *o2, PyObject *o3) {
 					setBigNum((PyLongObject *) o2, &rhs_val);
 					ans = createNewPoint(G, lhs->group); // ->group, lhs->ctx);
 					EC_POINT_mul(ans->group->ec_group, ans->P, NULL, lhs->P, rhs_val, ans->group->ctx);
+					BN_free(rhs_val);
 			}
 			else if(rhs == -1) {
 				debug("finding modular inverse.\n");
@@ -1007,7 +1009,7 @@ static PyObject *ECE_neg(PyObject *o1) {
 			obj2 = createNewPoint(ZR, obj1->group);
 			if(BN_copy(obj2->elemZ, obj1->elemZ) != NULL) {
 				int negate;
-				if(!BN_is_negative(obj2->elemZ)) negate = -1;
+				if(obj2->elemZ->neg == 0) negate = -1;
 				else negate = 0;
 				BN_set_negative(obj2->elemZ, negate);
 
@@ -1192,30 +1194,35 @@ static PyObject *ECE_getGen(ECElement *self, PyObject *arg) {
 /*
  * Takes an arbitrary string and returns a group element
  */
-EC_POINT *element_from_hash(EC_GROUP *group, BIGNUM *order, uint8_t *input, int input_len)
+void set_element_from_hash(ECElement *self, uint8_t *input, int input_len)
 {
-	EC_POINT *P = NULL;
+	if (self->type != G) {
+	    PyErr_SetString(PyECErrorObject, "element not of type G.");
+	}
+
 	BIGNUM *x = BN_new(), *y = BN_new();
 	int TryNextX = TRUE;
 	BN_CTX *ctx = BN_CTX_new();
+	ECGroup *gobj = self->group;
 	// assume input string is a binary string, then set x to (x mod q)
-	x = BN_bin2bn((const uint8_t *) input, input_len, NULL);
-	BN_mod(x, x, order, ctx);
-	P = EC_POINT_new(group);
+	BN_bin2bn((const uint8_t *) input, input_len, x);
+	BN_mod(x, x, gobj->order, ctx);
 	do {
 		// set x coordinate and then test whether it's on curve
+#ifdef DEBUG
 		char *xstr = BN_bn2dec(x);
 		debug("Generating another x => %s\n", xstr);
 		OPENSSL_free(xstr);
-		EC_POINT_set_compressed_coordinates_GFp(group, P, x, 1, ctx);
-		EC_POINT_get_affine_coordinates_GFp(group, P, x, y, ctx);
+#endif
+		EC_POINT_set_compressed_coordinates_GFp(gobj->ec_group, self->P, x, 1, ctx);
+		EC_POINT_get_affine_coordinates_GFp(gobj->ec_group, self->P, x, y, ctx);
 
 		if(BN_is_zero(x) || BN_is_zero(y)) {
 			BN_add(x, x, BN_value_one());
 			continue;
 		}
 
-		if(EC_POINT_is_on_curve(group, P, ctx)) {
+		if(EC_POINT_is_on_curve(gobj->ec_group, self->P, ctx)) {
 			TryNextX = FALSE;
 		}
 		else {
@@ -1226,7 +1233,6 @@ EC_POINT *element_from_hash(EC_GROUP *group, BIGNUM *order, uint8_t *input, int 
 	BN_free(x);
 	BN_free(y);
 	BN_CTX_free(ctx);
-	return P;
 }
 
 static PyObject *ECE_hash(ECElement *self, PyObject *args) {
@@ -1251,7 +1257,7 @@ static PyObject *ECE_hash(ECElement *self, PyObject *args) {
 			printf_buffer_as_hex(hash_buf, hash_len);
 			// generate an EC element from message digest
 			hashObj = createNewPoint(G, gobj);
-			hashObj->P = element_from_hash(gobj->ec_group, gobj->order, (uint8_t *) hash_buf, hash_len);
+			set_element_from_hash(hashObj, (uint8_t *) hash_buf, hash_len);
 			return (PyObject *) hashObj;
 		}
 		else if(type == ZR) {
@@ -1373,7 +1379,7 @@ static PyObject *ECE_encode(ECElement *self, PyObject *args) {
             return (PyObject *) encObj;
         }
         else {
-            printf("expected message len: %d, you provided: %d\n", (max_len - sizeof(uint32_t)), msg_len);
+            printf("expected message len: %lu, you provided: %d\n", (max_len - sizeof(uint32_t)), msg_len);
             EXIT_IF(TRUE, "message length does not match the selected group size.");
         }
 	}
@@ -1401,18 +1407,17 @@ static PyObject *ECE_decode(ECElement *self, PyObject *args) {
 			BIGNUM *x = BN_new(), *y = BN_new();
 			// verifies that element is on the curve then gets coordinates
 			EC_POINT_get_affine_coordinates_GFp(gobj->ec_group, obj->P, x, y, gobj->ctx);
-
-            int max_byte_len = BN_num_bytes(gobj->order);
-            int prepend_zeros = max_byte_len;
-            // by default we will strip out the counter part (unless specified otherwise by user)
-            if (include_ctr == FALSE) {
-                max_byte_len -= RESERVED_ENCODING_BYTES;
-	        }
-            debug("Size of order => '%d'\n", max_byte_len);
+			int max_byte_len = BN_num_bytes(gobj->order);
+			int prepend_zeros = max_byte_len;
+			// by default we will strip out the counter part (unless specified otherwise by user)
+			if (include_ctr == FALSE) {
+				max_byte_len -= RESERVED_ENCODING_BYTES;
+			}
+			debug("Size of order => '%d'\n", max_byte_len);
 			int x_len = BN_num_bytes(x);
 			prepend_zeros -= x_len;
 			if (prepend_zeros > 0) {
-                x_len += prepend_zeros;
+                		x_len += prepend_zeros;
 			}
 			uint8_t *xstr = (uint8_t*) malloc(x_len + 1);
 			memset(xstr, 0, x_len);
@@ -1425,8 +1430,8 @@ static PyObject *ECE_decode(ECElement *self, PyObject *args) {
 			BN_free(x);
 			BN_free(y);
 
-            int size_msg = max_byte_len;
-			PyObject *decObj = PyBytes_FromStringAndSize(xstr, size_msg);
+            		int size_msg = max_byte_len;
+			PyObject *decObj = PyBytes_FromStringAndSize((const char *)xstr, size_msg);
 			OPENSSL_free(xstr);
 			return decObj;
 		}
@@ -1466,7 +1471,7 @@ static PyObject *Serialize(ECElement *self, PyObject *args) {
 			size_t len = BN_num_bytes(obj->elemZ);
 			uint8_t z_buf[len+1];
 			memset(z_buf, 0, len);
-			if(BN_bn2bin(obj->elemZ, z_buf) == len) {
+			if((size_t)BN_bn2bin(obj->elemZ, z_buf) == len) {
 				// we're okay
 				// convert z_buf to base64 and the rest is history.
 				size_t length = 0;
